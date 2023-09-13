@@ -14,11 +14,12 @@
 #include "src/base/sanitizer/msan.h"
 #include "src/common/globals.h"
 #include "src/heap/base/active-system-pages.h"
+#include "src/heap/concurrent-allocator.h"
 #include "src/heap/concurrent-marking.h"
 #include "src/heap/heap.h"
 #include "src/heap/incremental-marking-inl.h"
-#include "src/heap/invalidated-slots-inl.h"
 #include "src/heap/large-spaces.h"
+#include "src/heap/main-allocator-inl.h"
 #include "src/heap/mark-compact.h"
 #include "src/heap/memory-chunk-layout.h"
 #include "src/heap/memory-chunk.h"
@@ -37,188 +38,6 @@
 namespace v8 {
 namespace internal {
 
-// These checks are here to ensure that the lower 32 bits of any real heap
-// object can't overlap with the lower 32 bits of cleared weak reference value
-// and therefore it's enough to compare only the lower 32 bits of a MaybeObject
-// in order to figure out if it's a cleared weak reference or not.
-static_assert(kClearedWeakHeapObjectLower32 > 0);
-static_assert(kClearedWeakHeapObjectLower32 < Page::kHeaderSize);
-
-// static
-constexpr Page::MainThreadFlags Page::kCopyOnFlipFlagsMask;
-
-Page::Page(Heap* heap, BaseSpace* space, size_t size, Address area_start,
-           Address area_end, VirtualMemory reservation,
-           Executability executable)
-    : MemoryChunk(heap, space, size, area_start, area_end,
-                  std::move(reservation), executable, PageSize::kRegular) {}
-
-void Page::AllocateFreeListCategories() {
-  DCHECK_NULL(categories_);
-  categories_ =
-      new FreeListCategory*[owner()->free_list()->number_of_categories()]();
-  for (int i = kFirstCategory; i <= owner()->free_list()->last_category();
-       i++) {
-    DCHECK_NULL(categories_[i]);
-    categories_[i] = new FreeListCategory();
-  }
-}
-
-void Page::InitializeFreeListCategories() {
-  for (int i = kFirstCategory; i <= owner()->free_list()->last_category();
-       i++) {
-    categories_[i]->Initialize(static_cast<FreeListCategoryType>(i));
-  }
-}
-
-void Page::ReleaseFreeListCategories() {
-  if (categories_ != nullptr) {
-    for (int i = kFirstCategory; i <= owner()->free_list()->last_category();
-         i++) {
-      if (categories_[i] != nullptr) {
-        delete categories_[i];
-        categories_[i] = nullptr;
-      }
-    }
-    delete[] categories_;
-    categories_ = nullptr;
-  }
-}
-
-Page* Page::ConvertNewToOld(Page* old_page) {
-  DCHECK(old_page);
-  DCHECK(old_page->InNewSpace());
-  OldSpace* old_space = old_page->heap()->old_space();
-  old_page->set_owner(old_space);
-  old_page->ClearFlags(Page::kAllFlagsMask);
-  Page* new_page = old_space->InitializePage(old_page);
-  old_space->AddPage(new_page);
-  return new_page;
-}
-
-size_t Page::AvailableInFreeList() {
-  size_t sum = 0;
-  ForAllFreeListCategories([&sum](FreeListCategory* category) {
-    sum += category->available();
-  });
-  return sum;
-}
-
-#ifdef DEBUG
-namespace {
-// Skips filler starting from the given filler until the end address.
-// Returns the first address after the skipped fillers.
-Address SkipFillers(PtrComprCageBase cage_base, HeapObject filler,
-                    Address end) {
-  Address addr = filler.address();
-  while (addr < end) {
-    filler = HeapObject::FromAddress(addr);
-    CHECK(filler.IsFreeSpaceOrFiller(cage_base));
-    addr = filler.address() + filler.Size(cage_base);
-  }
-  return addr;
-}
-}  // anonymous namespace
-#endif  // DEBUG
-
-size_t Page::ShrinkToHighWaterMark() {
-  // Shrinking only makes sense outside of the CodeRange, where we don't care
-  // about address space fragmentation.
-  VirtualMemory* reservation = reserved_memory();
-  if (!reservation->IsReserved()) return 0;
-
-  // Shrink pages to high water mark. The water mark points either to a filler
-  // or the area_end.
-  HeapObject filler = HeapObject::FromAddress(HighWaterMark());
-  if (filler.address() == area_end()) return 0;
-  PtrComprCageBase cage_base(heap()->isolate());
-  CHECK(filler.IsFreeSpaceOrFiller(cage_base));
-  // Ensure that no objects were allocated in [filler, area_end) region.
-  DCHECK_EQ(area_end(), SkipFillers(cage_base, filler, area_end()));
-  // Ensure that no objects will be allocated on this page.
-  DCHECK_EQ(0u, AvailableInFreeList());
-
-  // Ensure that slot sets are empty. Otherwise the buckets for the shrunk
-  // area would not be freed when deallocating this page.
-  DCHECK_NULL(slot_set<OLD_TO_NEW>());
-  DCHECK_NULL(slot_set<OLD_TO_OLD>());
-
-  size_t unused = RoundDown(static_cast<size_t>(area_end() - filler.address()),
-                            MemoryAllocator::GetCommitPageSize());
-  if (unused > 0) {
-    DCHECK_EQ(0u, unused % MemoryAllocator::GetCommitPageSize());
-    if (v8_flags.trace_gc_verbose) {
-      PrintIsolate(heap()->isolate(), "Shrinking page %p: end %p -> %p\n",
-                   reinterpret_cast<void*>(this),
-                   reinterpret_cast<void*>(area_end()),
-                   reinterpret_cast<void*>(area_end() - unused));
-    }
-    heap()->CreateFillerObjectAt(
-        filler.address(),
-        static_cast<int>(area_end() - filler.address() - unused));
-    heap()->memory_allocator()->PartialFreeMemory(
-        this, address() + size() - unused, unused, area_end() - unused);
-    if (filler.address() != area_end()) {
-      CHECK(filler.IsFreeSpaceOrFiller(cage_base));
-      CHECK_EQ(filler.address() + filler.Size(cage_base), area_end());
-    }
-  }
-  return unused;
-}
-
-void Page::CreateBlackArea(Address start, Address end) {
-  DCHECK_NE(NEW_SPACE, owner_identity());
-  DCHECK(heap()->incremental_marking()->black_allocation());
-  DCHECK_EQ(Page::FromAddress(start), this);
-  DCHECK_LT(start, end);
-  DCHECK_EQ(Page::FromAddress(end - 1), this);
-  MarkingState* marking_state = heap()->marking_state();
-  marking_state->bitmap(this)->SetRange(AddressToMarkbitIndex(start),
-                                        AddressToMarkbitIndex(end));
-  marking_state->IncrementLiveBytes(this, static_cast<intptr_t>(end - start));
-}
-
-void Page::CreateBlackAreaBackground(Address start, Address end) {
-  DCHECK_NE(NEW_SPACE, owner_identity());
-  DCHECK(heap()->incremental_marking()->black_allocation());
-  DCHECK_EQ(Page::FromAddress(start), this);
-  DCHECK_LT(start, end);
-  DCHECK_EQ(Page::FromAddress(end - 1), this);
-  AtomicMarkingState* marking_state = heap()->atomic_marking_state();
-  marking_state->bitmap(this)->SetRange(AddressToMarkbitIndex(start),
-                                        AddressToMarkbitIndex(end));
-  heap()->incremental_marking()->IncrementLiveBytesBackground(
-      this, static_cast<intptr_t>(end - start));
-}
-
-void Page::DestroyBlackArea(Address start, Address end) {
-  DCHECK_NE(NEW_SPACE, owner_identity());
-  DCHECK(heap()->incremental_marking()->black_allocation());
-  DCHECK_EQ(Page::FromAddress(start), this);
-  DCHECK_LT(start, end);
-  DCHECK_EQ(Page::FromAddress(end - 1), this);
-  MarkingState* marking_state = heap()->marking_state();
-  marking_state->bitmap(this)->ClearRange(AddressToMarkbitIndex(start),
-                                          AddressToMarkbitIndex(end));
-  marking_state->IncrementLiveBytes(this, -static_cast<intptr_t>(end - start));
-}
-
-void Page::DestroyBlackAreaBackground(Address start, Address end) {
-  DCHECK_NE(NEW_SPACE, owner_identity());
-  DCHECK(heap()->incremental_marking()->black_allocation());
-  DCHECK_EQ(Page::FromAddress(start), this);
-  DCHECK_LT(start, end);
-  DCHECK_EQ(Page::FromAddress(end - 1), this);
-  AtomicMarkingState* marking_state = heap()->atomic_marking_state();
-  marking_state->bitmap(this)->ClearRange(AddressToMarkbitIndex(start),
-                                          AddressToMarkbitIndex(end));
-  heap()->incremental_marking()->IncrementLiveBytesBackground(
-      this, -static_cast<intptr_t>(end - start));
-}
-
-// -----------------------------------------------------------------------------
-// PagedSpace implementation
-
 void Space::AddAllocationObserver(AllocationObserver* observer) {
   allocation_counter_.AddAllocationObserver(observer);
 }
@@ -226,6 +45,15 @@ void Space::AddAllocationObserver(AllocationObserver* observer) {
 void Space::RemoveAllocationObserver(AllocationObserver* observer) {
   allocation_counter_.RemoveAllocationObserver(observer);
 }
+
+SpaceWithLinearArea::SpaceWithLinearArea(
+    Heap* heap, AllocationSpace id, std::unique_ptr<FreeList> free_list,
+    AllocationCounter& allocation_counter,
+    LinearAllocationArea& allocation_info,
+    LinearAreaOriginalData& linear_area_original_data)
+    : Space(heap, id, std::move(free_list), allocation_counter),
+      allocator_(heap, this, allocation_counter, allocation_info,
+                 linear_area_original_data) {}
 
 Address SpaceWithLinearArea::ComputeLimit(Address start, Address end,
                                           size_t min_size) const {
@@ -244,7 +72,8 @@ Address SpaceWithLinearArea::ComputeLimit(Address start, Address end,
 
   if (SupportsAllocationObserver() && heap()->IsAllocationObserverActive()) {
     // Ensure there are no unaccounted allocations.
-    DCHECK_EQ(allocation_info_.start(), allocation_info_.top());
+    DCHECK_EQ(allocator_.allocation_info().start(),
+              allocator_.allocation_info().top());
 
     size_t step = allocation_counter_.NextBytes();
     DCHECK_NE(step, 0);
@@ -261,20 +90,6 @@ Address SpaceWithLinearArea::ComputeLimit(Address start, Address end,
 
   DCHECK_LE(start + step_size, end);
   return start + std::max(step_size, min_size);
-}
-
-void SpaceWithLinearArea::UpdateAllocationOrigins(AllocationOrigin origin) {
-  DCHECK(!((origin != AllocationOrigin::kGC) &&
-           (heap()->isolate()->current_vm_state() == GC)));
-  allocations_origins_[static_cast<int>(origin)]++;
-}
-
-void SpaceWithLinearArea::PrintAllocationsOrigins() const {
-  PrintIsolate(
-      heap()->isolate(),
-      "Allocations Origins for %s: GeneratedCode:%zu - Runtime:%zu - GC:%zu\n",
-      name(), allocations_origins_[0], allocations_origins_[1],
-      allocations_origins_[2]);
 }
 
 LinearAllocationArea LocalAllocationBuffer::CloseAndMakeIterable() {
@@ -345,18 +160,20 @@ void SpaceWithLinearArea::ResumeAllocationObservers() {
 }
 
 void SpaceWithLinearArea::AdvanceAllocationObservers() {
-  if (allocation_info_.top() &&
-      allocation_info_.start() != allocation_info_.top()) {
+  if (allocator_.allocation_info().top() &&
+      allocator_.allocation_info().start() !=
+          allocator_.allocation_info().top()) {
     if (heap()->IsAllocationObserverActive()) {
-      allocation_counter_.AdvanceAllocationObservers(allocation_info_.top() -
-                                                     allocation_info_.start());
+      allocation_counter_.AdvanceAllocationObservers(
+          allocator_.allocation_info().top() -
+          allocator_.allocation_info().start());
     }
     MarkLabStartInitialized();
   }
 }
 
 void SpaceWithLinearArea::MarkLabStartInitialized() {
-  allocation_info_.ResetStart();
+  allocator_.allocation_info().ResetStart();
   if (identity() == NEW_SPACE) {
     heap()->new_space()->MoveOriginalTopForward();
 
@@ -387,25 +204,21 @@ void SpaceWithLinearArea::InvokeAllocationObservers(
 
   if (allocation_size >= allocation_counter_.NextBytes()) {
     // Only the first object in a LAB should reach the next step.
-    DCHECK_EQ(soon_object,
-              allocation_info_.start() + aligned_size_in_bytes - size_in_bytes);
+    DCHECK_EQ(soon_object, allocator_.allocation_info().start() +
+                               aligned_size_in_bytes - size_in_bytes);
 
     // Right now the LAB only contains that one object.
-    DCHECK_EQ(allocation_info_.top() + allocation_size - aligned_size_in_bytes,
-              allocation_info_.limit());
+    DCHECK_EQ(allocator_.allocation_info().top() + allocation_size -
+                  aligned_size_in_bytes,
+              allocator_.allocation_info().limit());
 
     // Ensure that there is a valid object
-    if (identity() == CODE_SPACE) {
-      MemoryChunk* chunk = MemoryChunk::FromAddress(soon_object);
-      heap()->UnprotectAndRegisterMemoryChunk(
-          chunk, UnprotectMemoryOrigin::kMainThread);
-    }
     heap_->CreateFillerObjectAt(soon_object, static_cast<int>(size_in_bytes));
 
 #if DEBUG
     // Ensure that allocation_info_ isn't modified during one of the
     // AllocationObserver::Step methods.
-    LinearAllocationArea saved_allocation_info = allocation_info_;
+    LinearAllocationArea saved_allocation_info = allocator_.allocation_info();
 #endif
 
     // Run AllocationObserver::Step through the AllocationCounter.
@@ -413,33 +226,33 @@ void SpaceWithLinearArea::InvokeAllocationObservers(
                                                   allocation_size);
 
     // Ensure that start/top/limit didn't change.
-    DCHECK_EQ(saved_allocation_info.start(), allocation_info_.start());
-    DCHECK_EQ(saved_allocation_info.top(), allocation_info_.top());
-    DCHECK_EQ(saved_allocation_info.limit(), allocation_info_.limit());
+    DCHECK_EQ(saved_allocation_info.start(),
+              allocator_.allocation_info().start());
+    DCHECK_EQ(saved_allocation_info.top(), allocator_.allocation_info().top());
+    DCHECK_EQ(saved_allocation_info.limit(),
+              allocator_.allocation_info().limit());
   }
 
-  DCHECK_LT(allocation_info_.limit() - allocation_info_.start(),
+  DCHECK_LT(allocator_.allocation_info().limit() -
+                allocator_.allocation_info().start(),
             allocation_counter_.NextBytes());
+}
+
+AllocationResult SpaceWithLinearArea::AllocateRawForceAlignmentForTesting(
+    int size_in_bytes, AllocationAlignment alignment, AllocationOrigin origin) {
+  return allocator_.AllocateRawForceAlignmentForTesting(size_in_bytes,
+                                                        alignment, origin);
 }
 
 #if DEBUG
 void SpaceWithLinearArea::VerifyTop() const {
   // Ensure validity of LAB: start <= top <= limit
-  DCHECK_LE(allocation_info_.start(), allocation_info_.top());
-  DCHECK_LE(allocation_info_.top(), allocation_info_.limit());
+  DCHECK_LE(allocator_.allocation_info().start(),
+            allocator_.allocation_info().top());
+  DCHECK_LE(allocator_.allocation_info().top(),
+            allocator_.allocation_info().limit());
 }
 #endif  // DEBUG
-
-int MemoryChunk::FreeListsLength() {
-  int length = 0;
-  for (int cat = kFirstCategory; cat <= owner()->free_list()->last_category();
-       cat++) {
-    if (categories_[cat] != nullptr) {
-      length += categories_[cat]->FreeListLength();
-    }
-  }
-  return length;
-}
 
 SpaceIterator::SpaceIterator(Heap* heap)
     : heap_(heap), current_space_(FIRST_MUTABLE_SPACE) {}

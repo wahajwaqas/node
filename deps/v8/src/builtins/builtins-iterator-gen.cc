@@ -250,7 +250,8 @@ TF_BUILTIN(IterableToFixedArrayForWasm, IteratorBuiltinsAssembler) {
 
   FillFixedArrayFromIterable(context, iterable, iterator_fn, &values);
 
-  GotoIf(WordEqual(SmiUntag(expected_length), values.var_length()->value()),
+  GotoIf(WordEqual(PositiveSmiUntag(expected_length),
+                   values.var_length()->value()),
          &done);
   Return(CallRuntime(
       Runtime::kThrowTypeError, context,
@@ -339,7 +340,8 @@ TF_BUILTIN(StringFixedArrayFromIterable, IteratorBuiltinsAssembler) {
 // will be copied to the new array, which is inconsistent with the behavior of
 // an actual iteration, where holes should be replaced with undefined (if the
 // prototype has no elements). To maintain the correct behavior for holey
-// arrays, use the builtins IterableToList or IterableToListWithSymbolLookup.
+// arrays, use the builtins IterableToList or IterableToListWithSymbolLookup or
+// IterableToListConvertHoles.
 TF_BUILTIN(IterableToListMayPreserveHoles, IteratorBuiltinsAssembler) {
   auto context = Parameter<Context>(Descriptor::kContext);
   auto iterable = Parameter<Object>(Descriptor::kIterable);
@@ -351,6 +353,29 @@ TF_BUILTIN(IterableToListMayPreserveHoles, IteratorBuiltinsAssembler) {
 
   // The fast path will copy holes to the new array.
   TailCallBuiltin(Builtin::kCloneFastJSArray, context, iterable);
+
+  BIND(&slow_path);
+  TailCallBuiltin(Builtin::kIterableToList, context, iterable, iterator_fn);
+}
+
+// This builtin always returns a new JSArray and is thus safe to use even in the
+// presence of code that may call back into user-JS. This builtin will take the
+// fast path if the iterable is a fast array and the Array prototype and the
+// Symbol.iterator is untouched. The fast path skips the iterator and copies the
+// backing store to the new array. Note that if the array has holes, the holes
+// will be converted to undefined values in the new array (unlike
+// IterableToListMayPreserveHoles builtin).
+TF_BUILTIN(IterableToListConvertHoles, IteratorBuiltinsAssembler) {
+  auto context = Parameter<Context>(Descriptor::kContext);
+  auto iterable = Parameter<Object>(Descriptor::kIterable);
+  auto iterator_fn = Parameter<Object>(Descriptor::kIteratorFn);
+
+  Label slow_path(this);
+
+  GotoIfNot(IsFastJSArrayWithNoCustomIteration(context, iterable), &slow_path);
+
+  // The fast path will convert holes to undefined values in the new array.
+  TailCallBuiltin(Builtin::kCloneFastJSArrayFillingHoles, context, iterable);
 
   BIND(&slow_path);
   TailCallBuiltin(Builtin::kIterableToList, context, iterable, iterator_fn);
@@ -383,10 +408,10 @@ void IteratorBuiltinsAssembler::FastIterableToList(
         iterable, context, &string_maybe_fast_call, &check_map);
 
     BIND(&string_maybe_fast_call);
-    const TNode<IntPtrT> length = LoadStringLengthAsWord(CAST(iterable));
+    const TNode<Uint32T> length = LoadStringLengthAsWord32(CAST(iterable));
     // Use string length as conservative approximation of number of codepoints.
     GotoIf(
-        IntPtrGreaterThan(length, IntPtrConstant(JSArray::kMaxFastArrayLength)),
+        Uint32GreaterThan(length, Uint32Constant(JSArray::kMaxFastArrayLength)),
         slow);
     *var_result = CAST(CallBuiltin(Builtin::kStringToList, context, iterable));
     Goto(&done);

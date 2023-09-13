@@ -301,17 +301,22 @@ TEST(SemiSpaceNewSpace) {
   MemoryAllocator* memory_allocator = test_allocator_scope.allocator();
   LinearAllocationArea allocation_info;
 
-  std::unique_ptr<SemiSpaceNewSpace> new_space =
-      std::make_unique<SemiSpaceNewSpace>(
-          heap, CcTest::heap()->InitialSemiSpaceSize(),
-          CcTest::heap()->InitialSemiSpaceSize(), allocation_info);
+  auto new_space = std::make_unique<SemiSpaceNewSpace>(
+      heap, heap->InitialSemiSpaceSize(), heap->InitialSemiSpaceSize(),
+      allocation_info);
   CHECK(new_space->MaximumCapacity());
 
+  size_t successful_allocations = 0;
   while (new_space->Available() >= kMaxRegularHeapObjectSize) {
-    CHECK(new_space->Contains(
-        new_space->AllocateRaw(kMaxRegularHeapObjectSize, kTaggedAligned)
-            .ToObjectChecked()));
+    AllocationResult allocation =
+        new_space->AllocateRaw(kMaxRegularHeapObjectSize, kTaggedAligned);
+    if (allocation.IsFailure()) break;
+    successful_allocations++;
+    Tagged<Object> obj = allocation.ToObjectChecked();
+    Tagged<HeapObject> ho = HeapObject::cast(obj);
+    CHECK(new_space->Contains(ho));
   }
+  CHECK_LT(0, successful_allocations);
 
   new_space.reset();
   memory_allocator->unmapper()->EnsureUnmappingCompleted();
@@ -326,21 +331,22 @@ TEST(PagedNewSpace) {
   MemoryAllocator* memory_allocator = test_allocator_scope.allocator();
   LinearAllocationArea allocation_info;
 
-  std::unique_ptr<PagedNewSpace> new_space = std::make_unique<PagedNewSpace>(
-      heap, CcTest::heap()->InitialSemiSpaceSize(),
-      CcTest::heap()->InitialSemiSpaceSize(), allocation_info);
+  auto new_space = std::make_unique<PagedNewSpace>(
+      heap, heap->InitialSemiSpaceSize(), heap->InitialSemiSpaceSize(),
+      allocation_info);
   CHECK(new_space->MaximumCapacity());
   CHECK(new_space->EnsureCurrentCapacity());
-  CHECK_LT(0, new_space->Capacity());
   CHECK_LT(0, new_space->TotalCapacity());
 
-  AllocationResult allocation_result;
   size_t successful_allocations = 0;
-  while (!(allocation_result = new_space->AllocateRaw(kMaxRegularHeapObjectSize,
-                                                      kTaggedAligned))
-              .IsFailure()) {
+  while (true) {
+    AllocationResult allocation =
+        new_space->AllocateRaw(kMaxRegularHeapObjectSize, kTaggedAligned);
+    if (allocation.IsFailure()) break;
     successful_allocations++;
-    CHECK(new_space->Contains(allocation_result.ToObjectChecked()));
+    Tagged<Object> obj = allocation.ToObjectChecked();
+    Tagged<HeapObject> ho = HeapObject::cast(obj);
+    CHECK(new_space->Contains(ho));
   }
   CHECK_LT(0, successful_allocations);
 
@@ -349,63 +355,71 @@ TEST(PagedNewSpace) {
 }
 
 TEST(OldSpace) {
+  v8_flags.max_heap_size = 20;
+  // This test uses its own old space, which confuses the incremental marker.
+  v8_flags.incremental_marking = false;
+  // This test doesn't expect GCs caused by concurrent allocations in the
+  // background thread.
+  v8_flags.stress_concurrent_allocation = false;
+
   Isolate* isolate = CcTest::i_isolate();
   Heap* heap = isolate->heap();
   TestMemoryAllocatorScope test_allocator_scope(isolate, heap->MaxReserved());
   LinearAllocationArea allocation_info;
 
-  OldSpace* s = new OldSpace(heap, allocation_info);
-  CHECK_NOT_NULL(s);
+  auto old_space = std::make_unique<OldSpace>(heap, allocation_info);
+  const int obj_size = kMaxRegularHeapObjectSize;
 
-  while (s->Available() > 0) {
-    s->AllocateRawUnaligned(kMaxRegularHeapObjectSize).ToObjectChecked();
+  size_t successful_allocations = 0;
+
+  while (true) {
+    AllocationResult allocation =
+        old_space->AllocateRaw(obj_size, kTaggedAligned);
+    if (allocation.IsFailure()) break;
+    successful_allocations++;
+    Tagged<Object> obj = allocation.ToObjectChecked();
+    Tagged<HeapObject> ho = HeapObject::cast(obj);
+    CHECK(old_space->Contains(ho));
   }
-
-  delete s;
+  CHECK_LT(0, successful_allocations);
 }
 
 TEST(OldLargeObjectSpace) {
-  // This test does not initialize allocated objects, which confuses the
+  v8_flags.max_heap_size = 20;
+  // This test uses its own old large object space, which confuses the
   // incremental marker.
   v8_flags.incremental_marking = false;
-  v8_flags.max_heap_size = 20;
   // This test doesn't expect GCs caused by concurrent allocations in the
   // background thread.
   v8_flags.stress_concurrent_allocation = false;
 
-  OldLargeObjectSpace* lo = CcTest::heap()->lo_space();
-  CHECK_NOT_NULL(lo);
-
-  int lo_size = Page::kPageSize;
-
-  Object obj = lo->AllocateRaw(lo_size).ToObjectChecked();
-  CHECK(obj.IsHeapObject());
-
-  HeapObject ho = HeapObject::cast(obj);
-
-  CHECK(lo->Contains(HeapObject::cast(obj)));
-
-  CHECK(lo->Contains(ho));
-
-  CHECK_EQ(0, Heap::GetFillToAlign(ho.address(), kTaggedAligned));
-  // All large objects have the same alignment because they start at the
-  // same offset within a page. Fixed double arrays have the most strict
-  // alignment requirements.
-  CHECK_EQ(
-      0, Heap::GetFillToAlign(
-             ho.address(),
-             HeapObject::RequiredAlignment(
-                 ReadOnlyRoots(CcTest::i_isolate()).fixed_double_array_map())));
   Isolate* isolate = CcTest::i_isolate();
+  Heap* heap = isolate->heap();
+
+  auto lo = std::make_unique<OldLargeObjectSpace>(heap);
+  const int lo_size = Page::kPageSize;
+
   HandleScope handle_scope(isolate);
+  Tagged<Map> map = ReadOnlyRoots(isolate).fixed_double_array_map();
+  size_t successful_allocations = 0;
+
   while (true) {
-    {
-      AllocationResult allocation = lo->AllocateRaw(lo_size);
-      if (allocation.IsFailure()) break;
-      ho = HeapObject::cast(allocation.ToObjectChecked());
-      Handle<HeapObject> keep_alive(ho, isolate);
-    }
+    AllocationResult allocation = lo->AllocateRaw(lo_size);
+    if (allocation.IsFailure()) break;
+    successful_allocations++;
+    Tagged<Object> obj = allocation.ToObjectChecked();
+    CHECK(IsHeapObject(obj));
+    Tagged<HeapObject> ho = HeapObject::cast(obj);
+    CHECK(lo->Contains(ho));
+    CHECK_EQ(0, Heap::GetFillToAlign(ho.address(), kTaggedAligned));
+    // All large objects have the same alignment because they start at the
+    // same offset within a page. Fixed double arrays have the most strict
+    // alignment requirements.
+    CHECK_EQ(0, Heap::GetFillToAlign(ho.address(),
+                                     HeapObject::RequiredAlignment(map)));
+    Handle<HeapObject> keep_alive(ho, isolate);
   }
+  CHECK_LT(0, successful_allocations);
 
   CHECK(!lo->IsEmpty());
   CHECK(lo->AllocateRaw(lo_size).IsFailure());
@@ -468,29 +482,31 @@ TEST(SizeOfInitialHeap) {
 }
 #endif  // DEBUG
 
-static HeapObject AllocateUnaligned(NewSpace* space, int size) {
+static Tagged<HeapObject> AllocateUnaligned(NewSpace* space, int size) {
   AllocationResult allocation = space->AllocateRaw(size, kTaggedAligned);
   CHECK(!allocation.IsFailure());
-  HeapObject filler;
+  Tagged<HeapObject> filler;
   CHECK(allocation.To(&filler));
   space->heap()->CreateFillerObjectAt(filler.address(), size);
   return filler;
 }
 
-static HeapObject AllocateUnaligned(PagedSpace* space, int size) {
+static Tagged<HeapObject> AllocateUnaligned(PagedSpace* space, int size) {
   AllocationResult allocation = space->AllocateRaw(size, kTaggedAligned);
   CHECK(!allocation.IsFailure());
-  HeapObject filler;
+  Tagged<HeapObject> filler;
   CHECK(allocation.To(&filler));
   space->heap()->CreateFillerObjectAt(filler.address(), size);
   return filler;
 }
 
-static HeapObject AllocateUnaligned(OldLargeObjectSpace* space, int size) {
+static Tagged<HeapObject> AllocateUnaligned(OldLargeObjectSpace* space,
+                                            int size) {
   AllocationResult allocation = space->AllocateRaw(size);
   CHECK(!allocation.IsFailure());
-  HeapObject filler;
+  Tagged<HeapObject> filler;
   CHECK(allocation.To(&filler));
+  space->heap()->CreateFillerObjectAt(filler.address(), size);
   return filler;
 }
 
@@ -613,7 +629,7 @@ UNINITIALIZED_TEST(InlineAllocationObserverCadence) {
 
     // Clear out any pre-existing garbage to make the test consistent
     // across snapshot/no-snapshot builds.
-    CcTest::CollectAllGarbage(i_isolate);
+    heap::InvokeMajorGC(i_isolate->heap());
 
     NewSpace* new_space = i_isolate->heap()->new_space();
 
@@ -655,7 +671,7 @@ HEAP_TEST(Regress777177) {
     heap::SimulateFullSpace(old_space);
     AllocationResult result =
         old_space->AllocateRaw(filler_size, kTaggedAligned);
-    HeapObject obj = result.ToObjectChecked();
+    Tagged<HeapObject> obj = result.ToObjectChecked();
     heap->CreateFillerObjectAt(obj.address(), filler_size);
   }
 
@@ -664,7 +680,7 @@ HEAP_TEST(Regress777177) {
     // top_on_previous_step_ to the next page.
     AllocationResult result =
         old_space->AllocateRaw(max_object_size, kTaggedAligned);
-    HeapObject obj = result.ToObjectChecked();
+    Tagged<HeapObject> obj = result.ToObjectChecked();
     // Simulate allocation folding moving the top pointer back.
     old_space->SetTopAndLimit(obj.address(), old_space->limit(),
                               old_space->limit());
@@ -674,7 +690,7 @@ HEAP_TEST(Regress777177) {
     // This triggers assert in crbug.com/777177.
     AllocationResult result =
         old_space->AllocateRaw(filler_size, kTaggedAligned);
-    HeapObject obj = result.ToObjectChecked();
+    Tagged<HeapObject> obj = result.ToObjectChecked();
     heap->CreateFillerObjectAt(obj.address(), filler_size);
   }
   old_space->RemoveAllocationObserver(&observer);
@@ -704,7 +720,7 @@ HEAP_TEST(Regress791582) {
   {
     AllocationResult result =
         new_space->AllocateRaw(until_page_end, kTaggedAligned);
-    HeapObject obj = result.ToObjectChecked();
+    Tagged<HeapObject> obj = result.ToObjectChecked();
     heap->CreateFillerObjectAt(obj.address(), until_page_end);
     // Simulate allocation folding moving the top pointer back.
     *new_space->allocation_top_address() = obj.address();
@@ -713,7 +729,7 @@ HEAP_TEST(Regress791582) {
   {
     // This triggers assert in crbug.com/791582
     AllocationResult result = new_space->AllocateRaw(256, kTaggedAligned);
-    HeapObject obj = result.ToObjectChecked();
+    Tagged<HeapObject> obj = result.ToObjectChecked();
     heap->CreateFillerObjectAt(obj.address(), 256);
   }
   new_space->RemoveAllocationObserver(&observer);
@@ -739,8 +755,9 @@ TEST(ShrinkPageToHighWaterMarkFreeSpaceEnd) {
   old_space->FreeLinearAllocationArea();
   old_space->ResetFreeList();
 
-  HeapObject filler = HeapObject::FromAddress(array->address() + array->Size());
-  CHECK(filler.IsFreeSpace());
+  Tagged<HeapObject> filler =
+      HeapObject::FromAddress(array->address() + array->Size());
+  CHECK(IsFreeSpace(filler));
   size_t shrunk = old_space->ShrinkPageToHighWaterMark(page);
   size_t should_have_shrunk = RoundDown(
       static_cast<size_t>(MemoryChunkLayout::AllocatableMemoryInDataPage() -
@@ -792,8 +809,9 @@ TEST(ShrinkPageToHighWaterMarkOneWordFiller) {
   old_space->FreeLinearAllocationArea();
   old_space->ResetFreeList();
 
-  HeapObject filler = HeapObject::FromAddress(array->address() + array->Size());
-  CHECK_EQ(filler.map(),
+  Tagged<HeapObject> filler =
+      HeapObject::FromAddress(array->address() + array->Size());
+  CHECK_EQ(filler->map(),
            ReadOnlyRoots(CcTest::heap()).one_pointer_filler_map());
 
   size_t shrunk = old_space->ShrinkPageToHighWaterMark(page);
@@ -820,8 +838,9 @@ TEST(ShrinkPageToHighWaterMarkTwoWordFiller) {
   old_space->FreeLinearAllocationArea();
   old_space->ResetFreeList();
 
-  HeapObject filler = HeapObject::FromAddress(array->address() + array->Size());
-  CHECK_EQ(filler.map(),
+  Tagged<HeapObject> filler =
+      HeapObject::FromAddress(array->address() + array->Size());
+  CHECK_EQ(filler->map(),
            ReadOnlyRoots(CcTest::heap()).two_pointer_filler_map());
 
   size_t shrunk = old_space->ShrinkPageToHighWaterMark(page);
@@ -953,7 +972,7 @@ TEST(ReadOnlySpaceMetrics_AlignedAllocations) {
 
   int alignment = USE_ALLOCATION_ALIGNMENT_BOOL ? kDoubleSize : kTaggedSize;
 
-  HeapObject object =
+  Tagged<HeapObject> object =
       faked_space->AllocateRaw(object_size, kDoubleAligned).ToObjectChecked();
   CHECK_EQ(object.address() % alignment, 0);
   object =

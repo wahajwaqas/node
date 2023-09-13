@@ -41,6 +41,7 @@
 
 #if V8_ENABLE_WEBASSEMBLY
 #include "src/wasm/wasm-external-refs.h"
+#include "src/wasm/wasm-js.h"
 #endif  // V8_ENABLE_WEBASSEMBLY
 
 #ifdef V8_INTL_SUPPORT
@@ -248,6 +249,17 @@ ExternalReference::shared_external_pointer_table_address_address(
   return ExternalReference(
       isolate->shared_external_pointer_table_address_address());
 }
+
+ExternalReference ExternalReference::code_pointer_table_address() {
+  // TODO(saelo) remove this ifdef when merging V8_CODE_POINTER_SANDBOXING into
+  // V8_ENABLE_SANDBOX
+#ifdef V8_CODE_POINTER_SANDBOXING
+  return ExternalReference(GetProcessWideCodePointerTable()->base_address());
+#else
+  return ExternalReference(kNullAddress);
+#endif
+}
+
 #endif  // V8_ENABLE_SANDBOX
 
 ExternalReference ExternalReference::interpreter_dispatch_table_address(
@@ -325,6 +337,14 @@ struct IsValidExternalReferenceType<Result (Class::*)(Args...)> {
 
 }  // namespace
 
+// .. for functions that will not be called through CallCFunction. For these,
+// all signatures are valid.
+#define RAW_FUNCTION_REFERENCE(Name, Target)         \
+  ExternalReference ExternalReference::Name() {      \
+    return ExternalReference(FUNCTION_ADDR(Target)); \
+  }
+
+// .. for functions that will be called through CallCFunction.
 #define FUNCTION_REFERENCE(Name, Target)                                   \
   ExternalReference ExternalReference::Name() {                            \
     static_assert(IsValidExternalReferenceType<decltype(&Target)>::value); \
@@ -340,6 +360,9 @@ struct IsValidExternalReferenceType<Result (Class::*)(Args...)> {
 FUNCTION_REFERENCE(write_barrier_marking_from_code_function,
                    WriteBarrier::MarkingFromCode)
 
+FUNCTION_REFERENCE(write_barrier_indirect_pointer_marking_from_code_function,
+                   WriteBarrier::IndirectPointerMarkingFromCode)
+
 FUNCTION_REFERENCE(write_barrier_shared_marking_from_code_function,
                    WriteBarrier::SharedMarkingFromCode)
 
@@ -348,6 +371,32 @@ FUNCTION_REFERENCE(shared_barrier_from_code_function,
 
 FUNCTION_REFERENCE(insert_remembered_set_function,
                    Heap::InsertIntoRememberedSetFromCode)
+
+namespace {
+
+intptr_t DebugBreakAtEntry(Isolate* isolate, Address raw_sfi) {
+  DisallowGarbageCollection no_gc;
+  Tagged<SharedFunctionInfo> sfi =
+      SharedFunctionInfo::cast(Tagged<Object>(raw_sfi));
+  return isolate->debug()->BreakAtEntry(sfi) ? 1 : 0;
+}
+
+Address DebugGetCoverageInfo(Isolate* isolate, Address raw_sfi) {
+  DisallowGarbageCollection no_gc;
+  Tagged<SharedFunctionInfo> sfi =
+      SharedFunctionInfo::cast(Tagged<Object>(raw_sfi));
+  base::Optional<Tagged<DebugInfo>> debug_info =
+      isolate->debug()->TryGetDebugInfo(sfi);
+  if (debug_info.has_value() && debug_info.value()->HasCoverageInfo()) {
+    return debug_info.value()->coverage_info().ptr();
+  }
+  return Smi::zero().ptr();
+}
+
+}  // namespace
+
+FUNCTION_REFERENCE(debug_break_at_entry_function, DebugBreakAtEntry)
+FUNCTION_REFERENCE(debug_get_coverage_info_function, DebugGetCoverageInfo)
 
 FUNCTION_REFERENCE(delete_handle_scope_extensions,
                    HandleScope::DeleteExtensions)
@@ -359,7 +408,8 @@ ExternalPointerHandle AllocateAndInitializeExternalPointerTableEntry(
     Isolate* isolate, Address pointer) {
 #ifdef V8_ENABLE_SANDBOX
   return isolate->external_pointer_table().AllocateAndInitializeEntry(
-      isolate, pointer, kExternalObjectValueTag);
+      isolate->heap()->external_pointer_space(), pointer,
+      kExternalObjectValueTag);
 #else
   return 0;
 #endif  // V8_ENABLE_SANDBOX
@@ -412,6 +462,11 @@ FUNCTION_REFERENCE(new_deoptimizer_function, Deoptimizer::New)
 FUNCTION_REFERENCE(compute_output_frames_function,
                    Deoptimizer::ComputeOutputFrames)
 
+IF_WASM(FUNCTION_REFERENCE, wasm_sync_stack_limit, wasm::sync_stack_limit)
+IF_WASM(FUNCTION_REFERENCE, wasm_switch_to_the_central_stack,
+        wasm::switch_to_the_central_stack)
+IF_WASM(FUNCTION_REFERENCE, wasm_switch_from_the_central_stack,
+        wasm::switch_from_the_central_stack)
 IF_WASM(FUNCTION_REFERENCE, wasm_f32_trunc, wasm::f32_trunc_wrapper)
 IF_WASM(FUNCTION_REFERENCE, wasm_f32_floor, wasm::f32_floor_wrapper)
 IF_WASM(FUNCTION_REFERENCE, wasm_f32_ceil, wasm::f32_ceil_wrapper)
@@ -470,10 +525,16 @@ IF_WASM(FUNCTION_REFERENCE, wasm_memory_init, wasm::memory_init_wrapper)
 IF_WASM(FUNCTION_REFERENCE, wasm_memory_copy, wasm::memory_copy_wrapper)
 IF_WASM(FUNCTION_REFERENCE, wasm_memory_fill, wasm::memory_fill_wrapper)
 IF_WASM(FUNCTION_REFERENCE, wasm_float64_pow, wasm::float64_pow_wrapper)
-IF_WASM(FUNCTION_REFERENCE, wasm_call_trap_callback_for_testing,
-        wasm::call_trap_callback_for_testing)
 IF_WASM(FUNCTION_REFERENCE, wasm_array_copy, wasm::array_copy_wrapper)
 IF_WASM(FUNCTION_REFERENCE, wasm_array_fill, wasm::array_fill_wrapper)
+IF_WASM(FUNCTION_REFERENCE_WITH_TYPE, wasm_string_to_f64,
+        wasm::flat_string_to_f64, BUILTIN_FP_POINTER_CALL)
+
+#ifdef V8_ENABLE_WEBASSEMBLY
+#define V(Name) RAW_FUNCTION_REFERENCE(wasm_##Name, wasm::Name)
+WASM_JS_EXTERNAL_REFERENCE_LIST(V)
+#undef V
+#endif  // V8_ENABLE_WEBASSEMBLY
 
 static void f64_acos_wrapper(Address data) {
   double input = ReadUnalignedValue<double>(data);
@@ -509,6 +570,15 @@ ExternalReference ExternalReference::allocation_sites_list_address(
 
 ExternalReference ExternalReference::address_of_jslimit(Isolate* isolate) {
   Address address = isolate->stack_guard()->address_of_jslimit();
+  // For efficient generated code, this should be root-register-addressable.
+  DCHECK(isolate->root_register_addressable_region().contains(address));
+  return ExternalReference(address);
+}
+
+ExternalReference ExternalReference::address_of_no_heap_write_interrupt_request(
+    Isolate* isolate) {
+  Address address = isolate->stack_guard()->address_of_interrupt_request(
+      StackGuard::InterruptLevel::kNoHeapWrites);
   // For efficient generated code, this should be root-register-addressable.
   DCHECK(isolate->root_register_addressable_region().contains(address));
   return ExternalReference(address);
@@ -613,11 +683,6 @@ ExternalReference::address_of_FLAG_harmony_regexp_unicode_sets() {
 // called address_of_FLAG_foo (easier grep-ability).
 ExternalReference ExternalReference::address_of_log_or_trace_osr() {
   return ExternalReference(&v8_flags.log_or_trace_osr);
-}
-
-ExternalReference
-ExternalReference::address_of_FLAG_harmony_symbol_as_weakmap_key() {
-  return ExternalReference(&v8_flags.harmony_symbol_as_weakmap_key);
 }
 
 ExternalReference ExternalReference::address_of_builtin_subclassing_flag() {
@@ -749,21 +814,21 @@ namespace {
 static uintptr_t BaselinePCForBytecodeOffset(Address raw_code_obj,
                                              int bytecode_offset,
                                              Address raw_bytecode_array) {
-  Code code_obj = Code::cast(Object(raw_code_obj));
-  BytecodeArray bytecode_array =
-      BytecodeArray::cast(Object(raw_bytecode_array));
-  return code_obj.GetBaselineStartPCForBytecodeOffset(bytecode_offset,
-                                                      bytecode_array);
+  Tagged<Code> code_obj = Code::cast(Tagged<Object>(raw_code_obj));
+  Tagged<BytecodeArray> bytecode_array =
+      BytecodeArray::cast(Tagged<Object>(raw_bytecode_array));
+  return code_obj->GetBaselineStartPCForBytecodeOffset(bytecode_offset,
+                                                       bytecode_array);
 }
 
 static uintptr_t BaselinePCForNextExecutedBytecode(Address raw_code_obj,
                                                    int bytecode_offset,
                                                    Address raw_bytecode_array) {
-  Code code_obj = Code::cast(Object(raw_code_obj));
-  BytecodeArray bytecode_array =
-      BytecodeArray::cast(Object(raw_bytecode_array));
-  return code_obj.GetBaselinePCForNextExecutedBytecode(bytecode_offset,
-                                                       bytecode_array);
+  Tagged<Code> code_obj = Code::cast(Tagged<Object>(raw_code_obj));
+  Tagged<BytecodeArray> bytecode_array =
+      BytecodeArray::cast(Tagged<Object>(raw_bytecode_array));
+  return code_obj->GetBaselinePCForNextExecutedBytecode(bytecode_offset,
+                                                        bytecode_array);
 }
 
 }  // namespace
@@ -777,16 +842,36 @@ ExternalReference ExternalReference::thread_in_wasm_flag_address_address(
   return ExternalReference(isolate->thread_in_wasm_flag_address_address());
 }
 
-ExternalReference ExternalReference::invoke_function_callback() {
-  Address thunk_address = FUNCTION_ADDR(&InvokeFunctionCallback);
-  ExternalReference::Type thunk_type = ExternalReference::PROFILING_API_CALL;
+ExternalReference ExternalReference::invoke_function_callback_generic() {
+  Address thunk_address = FUNCTION_ADDR(&InvokeFunctionCallbackGeneric);
+  ExternalReference::Type thunk_type = ExternalReference::DIRECT_API_CALL;
   ApiFunction thunk_fun(thunk_address);
   return ExternalReference::Create(&thunk_fun, thunk_type);
 }
 
+ExternalReference ExternalReference::invoke_function_callback_optimized() {
+  Address thunk_address = FUNCTION_ADDR(&InvokeFunctionCallbackOptimized);
+  ExternalReference::Type thunk_type = ExternalReference::DIRECT_API_CALL;
+  ApiFunction thunk_fun(thunk_address);
+  return ExternalReference::Create(&thunk_fun, thunk_type);
+}
+
+// static
+ExternalReference ExternalReference::invoke_function_callback(
+    CallApiCallbackMode mode) {
+  switch (mode) {
+    case CallApiCallbackMode::kGeneric:
+      return invoke_function_callback_generic();
+    case CallApiCallbackMode::kOptimized:
+      return invoke_function_callback_optimized();
+    case CallApiCallbackMode::kOptimizedNoProfiling:
+      return ExternalReference();
+  }
+}
+
 ExternalReference ExternalReference::invoke_accessor_getter_callback() {
   Address thunk_address = FUNCTION_ADDR(&InvokeAccessorGetterCallback);
-  ExternalReference::Type thunk_type = ExternalReference::PROFILING_GETTER_CALL;
+  ExternalReference::Type thunk_type = ExternalReference::DIRECT_GETTER_CALL;
   ApiFunction thunk_fun(thunk_address);
   return ExternalReference::Create(&thunk_fun, thunk_type);
 }
@@ -949,7 +1034,7 @@ void* libc_memmove(void* dest, const void* src, size_t n) {
 FUNCTION_REFERENCE(libc_memmove_function, libc_memmove)
 
 void* libc_memset(void* dest, int value, size_t n) {
-  DCHECK_EQ(static_cast<byte>(value), value);
+  DCHECK_EQ(static_cast<uint8_t>(value), value);
   return memset(dest, value, n);
 }
 
@@ -1020,14 +1105,14 @@ namespace {
 
 void StringWriteToFlatOneByte(Address source, uint8_t* sink, int32_t start,
                               int32_t length) {
-  return String::WriteToFlat<uint8_t>(String::cast(Object(source)), sink, start,
-                                      length);
+  return String::WriteToFlat<uint8_t>(String::cast(Tagged<Object>(source)),
+                                      sink, start, length);
 }
 
 void StringWriteToFlatTwoByte(Address source, uint16_t* sink, int32_t start,
                               int32_t length) {
-  return String::WriteToFlat<uint16_t>(String::cast(Object(source)), sink,
-                                       start, length);
+  return String::WriteToFlat<uint16_t>(String::cast(Tagged<Object>(source)),
+                                       sink, start, length);
 }
 
 const uint8_t* ExternalOneByteStringGetChars(Address string) {
@@ -1037,8 +1122,9 @@ const uint8_t* ExternalOneByteStringGetChars(Address string) {
   // merged by the linker, resulting in one of the input type's vtable address
   // failing the address range check.
   // TODO(chromium:1160961): Consider removing the CHECK when CFI is fixed.
-  CHECK(Object(string).IsExternalOneByteString(cage_base));
-  return ExternalOneByteString::cast(Object(string)).GetChars(cage_base);
+  CHECK(IsExternalOneByteString(Tagged<Object>(string), cage_base));
+  return ExternalOneByteString::cast(Tagged<Object>(string))
+      ->GetChars(cage_base);
 }
 const uint16_t* ExternalTwoByteStringGetChars(Address string) {
   PtrComprCageBase cage_base = GetPtrComprCageBaseFromOnHeapAddress(string);
@@ -1047,8 +1133,9 @@ const uint16_t* ExternalTwoByteStringGetChars(Address string) {
   // merged by the linker, resulting in one of the input type's vtable address
   // failing the address range check.
   // TODO(chromium:1160961): Consider removing the CHECK when CFI is fixed.
-  CHECK(Object(string).IsExternalTwoByteString(cage_base));
-  return ExternalTwoByteString::cast(Object(string)).GetChars(cage_base);
+  CHECK(IsExternalTwoByteString(Tagged<Object>(string), cage_base));
+  return ExternalTwoByteString::cast(Tagged<Object>(string))
+      ->GetChars(cage_base);
 }
 
 }  // namespace
@@ -1081,13 +1168,13 @@ FUNCTION_REFERENCE(orderedhashmap_gethash_raw, OrderedHashMap::GetHash)
 
 Address GetOrCreateHash(Isolate* isolate, Address raw_key) {
   DisallowGarbageCollection no_gc;
-  return Object(raw_key).GetOrCreateHash(isolate).ptr();
+  return Object::GetOrCreateHash(Tagged<Object>(raw_key), isolate).ptr();
 }
 
 FUNCTION_REFERENCE(get_or_create_hash_raw, GetOrCreateHash)
 
 static Address JSReceiverCreateIdentityHash(Isolate* isolate, Address raw_key) {
-  JSReceiver key = JSReceiver::cast(Object(raw_key));
+  Tagged<JSReceiver> key = JSReceiver::cast(Tagged<Object>(raw_key));
   return JSReceiver::CreateIdentityHash(isolate, key).ptr();
 }
 
@@ -1111,16 +1198,16 @@ static size_t NameDictionaryLookupForwardedString(Isolate* isolate,
   DisallowGarbageCollection no_gc;
   HandleScope handle_scope(isolate);
 
-  Handle<String> key(String::cast(Object(raw_key)), isolate);
+  Handle<String> key(String::cast(Tagged<Object>(raw_key)), isolate);
   // This function should only be used as the slow path for forwarded strings.
   DCHECK(Name::IsForwardingIndex(key->raw_hash_field()));
 
-  Dictionary dict = Dictionary::cast(Object(raw_dict));
+  Tagged<Dictionary> dict = Dictionary::cast(Tagged<Object>(raw_dict));
   ReadOnlyRoots roots(isolate);
   uint32_t hash = key->hash();
   InternalIndex entry = mode == kFindExisting
-                            ? dict.FindEntry(isolate, roots, key, hash)
-                            : dict.FindInsertionEntry(isolate, roots, hash);
+                            ? dict->FindEntry(isolate, roots, key, hash)
+                            : dict->FindInsertionEntry(isolate, roots, hash);
   return entry.raw_value();
 }
 
@@ -1162,8 +1249,8 @@ FUNCTION_REFERENCE(array_indexof_includes_double, ArrayIndexOfIncludesDouble)
 
 static Address LexicographicCompareWrapper(Isolate* isolate, Address smi_x,
                                            Address smi_y) {
-  Smi x(smi_x);
-  Smi y(smi_y);
+  Tagged<Smi> x(smi_x);
+  Tagged<Smi> y(smi_y);
   return Smi::LexicographicCompare(isolate, x, y);
 }
 
@@ -1247,8 +1334,8 @@ FUNCTION_REFERENCE(check_object_type, CheckObjectType)
 #ifdef V8_INTL_SUPPORT
 
 static Address ConvertOneByteToLower(Address raw_src, Address raw_dst) {
-  String src = String::cast(Object(raw_src));
-  String dst = String::cast(Object(raw_dst));
+  Tagged<String> src = String::cast(Tagged<Object>(raw_src));
+  Tagged<String> dst = String::cast(Tagged<Object>(raw_dst));
   return Intl::ConvertOneByteToLower(src, dst).ptr();
 }
 FUNCTION_REFERENCE(intl_convert_one_byte_to_lower, ConvertOneByteToLower)
@@ -1303,11 +1390,6 @@ ExternalReference ExternalReference::async_event_delegate_address(
   return ExternalReference(isolate->async_event_delegate_address());
 }
 
-ExternalReference ExternalReference::debug_execution_mode_address(
-    Isolate* isolate) {
-  return ExternalReference(isolate->debug_execution_mode_address());
-}
-
 ExternalReference ExternalReference::debug_is_active_address(Isolate* isolate) {
   return ExternalReference(isolate->debug()->is_active_address());
 }
@@ -1324,7 +1406,7 @@ ExternalReference ExternalReference::runtime_function_table_address(
 }
 
 static Address InvalidatePrototypeChainsWrapper(Address raw_map) {
-  Map map = Map::cast(Object(raw_map));
+  Tagged<Map> map = Map::cast(Tagged<Object>(raw_map));
   return JSObject::InvalidatePrototypeChains(map).ptr();
 }
 
@@ -1359,14 +1441,20 @@ ExternalReference ExternalReference::fast_api_call_target_address(
       isolate->isolate_data()->fast_api_call_target_address());
 }
 
+ExternalReference ExternalReference::api_callback_thunk_argument_address(
+    Isolate* isolate) {
+  return ExternalReference(
+      isolate->isolate_data()->api_callback_thunk_argument_address());
+}
+
 ExternalReference ExternalReference::stack_is_iterable_address(
     Isolate* isolate) {
   return ExternalReference(
       isolate->isolate_data()->stack_is_iterable_address());
 }
 
-ExternalReference ExternalReference::is_profiling_address(Isolate* isolate) {
-  return ExternalReference(isolate->isolate_data()->is_profiling_address());
+ExternalReference ExternalReference::execution_mode_address(Isolate* isolate) {
+  return ExternalReference(isolate->isolate_data()->execution_mode_address());
 }
 
 FUNCTION_REFERENCE(call_enqueue_microtask_function,
@@ -1607,7 +1695,8 @@ IF_TSAN(FUNCTION_REFERENCE, tsan_relaxed_load_function_64_bits,
 
 static int EnterMicrotaskContextWrapper(HandleScopeImplementer* hsi,
                                         Address raw_context) {
-  Context context = Context::cast(Object(raw_context));
+  Tagged<NativeContext> context =
+      NativeContext::cast(Tagged<Object>(raw_context));
   hsi->EnterMicrotaskContext(context);
   return 0;
 }
@@ -1653,6 +1742,7 @@ void abort_with_reason(int reason) {
   UNREACHABLE();
 }
 
+#undef RAW_FUNCTION_REFERENCE
 #undef FUNCTION_REFERENCE
 #undef FUNCTION_REFERENCE_WITH_TYPE
 
